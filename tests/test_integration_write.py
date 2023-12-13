@@ -137,6 +137,42 @@ def arrow_table_with_null() -> pa.Table:
     return pa.Table.from_pydict(TEST_DATA_WITH_NULL, schema=pa_schema)
 
 
+@pytest.fixture(scope="session")
+def mytable() -> pa.Table:
+    """PyArrow table with all kinds of columns"""
+
+    TEST_DATA_MINE = {
+        'id': ["jack", "rose", "helen"],
+        'dl_snapshot_date': [date(2023, 1, 1), None, date(2023, 3, 1)],
+    }
+    pa_schema = pa.schema(
+        [
+            ("id", pa.string()),
+            ("dl_snapshot_Date", pa.date32()),
+        ]
+    )
+    return pa.Table.from_pydict(TEST_DATA_MINE, schema=pa_schema)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def table_mytest(session_catalog: Catalog, mytable: pa.Table) -> None:
+    MY_TABLE_SCHEMA = Schema(
+        NestedField(field_id=1, name="id", field_type=StringType(), required=False),
+        NestedField(field_id=2, name="dl_snapshot_date", field_type=DateType(), required=False),
+    )
+    identifier = "default.mytest"
+
+    try:
+        session_catalog.drop_table(identifier=identifier)
+    except NoSuchTableError:
+        pass
+
+    tbl = session_catalog.create_table(identifier=identifier, schema=MY_TABLE_SCHEMA, properties={'format-version': '1'})
+    tbl.write_arrow(mytable)
+
+    assert tbl.format_version == 1, f"Expected v1, got: v{tbl.format_version}"
+
+
 @pytest.fixture(scope="session", autouse=True)
 def table_v1_with_null(session_catalog: Catalog, arrow_table_with_null: pa.Table) -> None:
     identifier = "default.arrow_table_v1_with_null"
