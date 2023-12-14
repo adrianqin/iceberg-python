@@ -414,10 +414,9 @@ def test_write_arrow_parquet_fields_projection(session_catalog: Catalog, simple_
     tbl = session_catalog.create_table(identifier=identifier, schema=iceberg_table_schema, properties={'format-version': '2'})
     tbl.write_arrow_modified(simple_table)
 
-    # table could still be read since number of parquet columns match that of iceberg
     print("Read table just written:", tbl.scan().to_arrow().to_pandas())
     
-    # but field ids in the parquet files are -1
+    # with modified metadata of the arrow schema, field ids in the parquet files are 1 and 2.
     path = (tbl.current_snapshot().manifests(tbl.io)[0].fetch_manifest_entry(tbl.io)[0].data_file.file_path)
     o = urlparse(path)
     s3fs = pa.fs.S3FileSystem(
