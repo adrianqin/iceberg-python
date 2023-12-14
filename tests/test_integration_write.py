@@ -137,40 +137,7 @@ def arrow_table_with_null() -> pa.Table:
     return pa.Table.from_pydict(TEST_DATA_WITH_NULL, schema=pa_schema)
 
 
-@pytest.fixture(scope="session")
-def mytable() -> pa.Table:
-    """PyArrow table with all kinds of columns"""
 
-    TEST_DATA_MINE = {
-        'id': ["jack", "rose", "helen"],
-        'dl_snapshot_date': [date(2023, 1, 1), None, date(2023, 3, 1)],
-    }
-    pa_schema = pa.schema(
-        [
-            ("id", pa.string()),
-            ("dl_snapshot_Date", pa.date32()),
-        ]
-    )
-    return pa.Table.from_pydict(TEST_DATA_MINE, schema=pa_schema)
-
-
-@pytest.fixture(scope="session", autouse=True)
-def table_mytest(session_catalog: Catalog, mytable: pa.Table) -> None:
-    MY_TABLE_SCHEMA = Schema(
-        NestedField(field_id=1, name="id", field_type=StringType(), required=False),
-        NestedField(field_id=2, name="dl_snapshot_date", field_type=DateType(), required=False),
-    )
-    identifier = "default.mytest"
-
-    try:
-        session_catalog.drop_table(identifier=identifier)
-    except NoSuchTableError:
-        pass
-
-    tbl = session_catalog.create_table(identifier=identifier, schema=MY_TABLE_SCHEMA, properties={'format-version': '1'})
-    tbl.write_arrow(mytable)
-
-    assert tbl.format_version == 1, f"Expected v1, got: v{tbl.format_version}"
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -385,3 +352,53 @@ def test_summaries(spark: SparkSession, session_catalog: Catalog, arrow_table_wi
         'total-position-deletes': '0',
         'total-records': '9',
     }
+
+
+@pytest.fixture(scope="session")
+def simple_table() -> pa.Table:
+    """A simple PyArrow table."""
+
+    TEST_DATA_MINE = {
+        'id': ["jack", "rose", "helen"],
+        'dl_snapshot_date': [date(2023, 1, 1), None, date(2023, 3, 1)],
+    }
+    pa_schema = pa.schema(
+        [
+            ("id", pa.string()),
+            ("dl_snapshot_date", pa.date32()),
+        ]
+    )
+    return pa.Table.from_pydict(TEST_DATA_MINE, schema=pa_schema)
+
+
+@pytest.mark.integration
+def test_write_arrow_parquet_fields_projection(session_catalog: Catalog, simple_table: pa.Table) -> None:
+    from urllib.parse import urlparse
+    iceberg_table_schema = Schema(
+        NestedField(field_id=1, name="id", field_type=StringType(), required=False),
+        NestedField(field_id=2, name="dl_snapshot_date", field_type=DateType(), required=False),
+    )
+    identifier = "default.test_fields_projection"
+
+    try:
+        session_catalog.drop_table(identifier=identifier)
+    except NoSuchTableError:
+        pass
+
+    tbl = session_catalog.create_table(identifier=identifier, schema=iceberg_table_schema, properties={'format-version': '2'})
+    tbl.write_arrow(simple_table)
+
+    # table could still be read since number of parquet columns match that of iceberg
+    print("Read table just written:", tbl.scan().to_arrow().to_pandas())
+    
+    # but field ids in the parquet files are -1
+    path = (tbl.current_snapshot().manifests(tbl.io)[0].fetch_manifest_entry(tbl.io)[0].data_file.file_path)
+    o = urlparse(path)
+    s3fs = pa.fs.S3FileSystem(
+        scheme="https",
+        endpoint_override="http://localhost:9000",
+        secret_key="password",
+        access_key="admin",
+    )
+    parquet_schema = pa.parquet.ParquetFile(s3fs.open_input_file(o.netloc + o.path)).schema
+    print("Schema of parquet file written by write_arrow has field ids as -1:", parquet_schema)
