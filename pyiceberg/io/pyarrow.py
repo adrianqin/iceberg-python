@@ -160,6 +160,7 @@ ONE_MEGABYTE = 1024 * 1024
 BUFFER_SIZE = "buffer-size"
 ICEBERG_SCHEMA = b"iceberg.schema"
 FIELD_ID = "field_id"
+PARQUET_FIELD_ID = "PARQUET:field_id"
 DOC = "doc"
 PYARROW_FIELD_ID_KEYS = [b"PARQUET:field_id", b"field_id"]
 PYARROW_FIELD_DOC_KEYS = [b"PARQUET:field_doc", b"field_doc", b"doc"]
@@ -439,6 +440,84 @@ class PyArrowFileIO(FileIO):
                 raise PermissionError(f"Cannot delete file, access denied: {location}") from e
             raise  # pragma: no cover - If some other kind of OSError, raise the raw error
 
+
+def schema_to_pyarrow_modified(schema: Union[Schema, IcebergType], metadata: Dict[bytes, bytes] = EMPTY_DICT) -> pa.schema:
+    return visit(schema, _ConvertToArrowSchemaModified(metadata))
+
+
+class _ConvertToArrowSchemaModified(SchemaVisitorPerPrimitiveType[pa.DataType]):
+    _metadata: Dict[bytes, bytes]
+
+    def __init__(self, metadata: Dict[bytes, bytes] = EMPTY_DICT) -> None:
+        self._metadata = metadata
+
+    def schema(self, _: Schema, struct_result: pa.StructType) -> pa.schema:
+        return pa.schema(list(struct_result), metadata=self._metadata)
+
+    def struct(self, _: StructType, field_results: List[pa.DataType]) -> pa.DataType:
+        return pa.struct(field_results)
+
+    def field(self, field: NestedField, field_result: pa.DataType) -> pa.Field:
+        return pa.field(
+            name=field.name,
+            type=field_result,
+            nullable=field.optional,
+            metadata={DOC: field.doc, PARQUET_FIELD_ID: str(field.field_id)} if field.doc else {PARQUET_FIELD_ID: str(field.field_id)},
+        )
+
+    def list(self, list_type: ListType, element_result: pa.DataType) -> pa.DataType:
+        element_field = self.field(list_type.element_field, element_result)
+        return pa.list_(value_type=element_field)
+
+    def map(self, map_type: MapType, key_result: pa.DataType, value_result: pa.DataType) -> pa.DataType:
+        key_field = self.field(map_type.key_field, key_result)
+        value_field = self.field(map_type.value_field, value_result)
+        return pa.map_(key_type=key_field, item_type=value_field)
+
+    def visit_fixed(self, fixed_type: FixedType) -> pa.DataType:
+        return pa.binary(len(fixed_type))
+
+    def visit_decimal(self, decimal_type: DecimalType) -> pa.DataType:
+        return pa.decimal128(decimal_type.precision, decimal_type.scale)
+
+    def visit_boolean(self, _: BooleanType) -> pa.DataType:
+        return pa.bool_()
+
+    def visit_integer(self, _: IntegerType) -> pa.DataType:
+        return pa.int32()
+
+    def visit_long(self, _: LongType) -> pa.DataType:
+        return pa.int64()
+
+    def visit_float(self, _: FloatType) -> pa.DataType:
+        # 32-bit IEEE 754 floating point
+        return pa.float32()
+
+    def visit_double(self, _: DoubleType) -> pa.DataType:
+        # 64-bit IEEE 754 floating point
+        return pa.float64()
+
+    def visit_date(self, _: DateType) -> pa.DataType:
+        # Date encoded as an int
+        return pa.date32()
+
+    def visit_time(self, _: TimeType) -> pa.DataType:
+        return pa.time64("us")
+
+    def visit_timestamp(self, _: TimestampType) -> pa.DataType:
+        return pa.timestamp(unit="us")
+
+    def visit_timestamptz(self, _: TimestamptzType) -> pa.DataType:
+        return pa.timestamp(unit="us", tz="UTC")
+
+    def visit_string(self, _: StringType) -> pa.DataType:
+        return pa.string()
+
+    def visit_uuid(self, _: UUIDType) -> pa.DataType:
+        return pa.binary(16)
+
+    def visit_binary(self, _: BinaryType) -> pa.DataType:
+        return pa.binary()
 
 def schema_to_pyarrow(schema: Union[Schema, IcebergType], metadata: Dict[bytes, bytes] = EMPTY_DICT) -> pa.schema:
     return visit(schema, _ConvertToArrowSchema(metadata))
@@ -1588,6 +1667,49 @@ def write_file(table: Table, tasks: Iterator[WriteTask]) -> Iterator[DataFile]:
 
     file_path = f'{table.location()}/data/{_generate_datafile_filename("parquet")}'
     file_schema = schema_to_pyarrow(table.schema())
+
+    collected_metrics: List[pq.FileMetaData] = []
+    fo = table.io.new_output(file_path)
+    with fo.create() as fos:
+        with pq.ParquetWriter(fos, schema=file_schema, version="1.0", metadata_collector=collected_metrics) as writer:
+            writer.write_table(df)
+
+    df = DataFile(
+        content=DataFileContent.DATA,
+        file_path=file_path,
+        file_format=FileFormat.PARQUET,
+        partition=Record(),
+        record_count=len(df),
+        file_size_in_bytes=len(fo),
+        # Just copy these from the table for now
+        sort_order_id=table.sort_order().order_id,
+        spec_id=table.spec().spec_id,
+        equality_ids=table.schema().identifier_field_ids,
+        key_metadata=None,
+    )
+    fill_parquet_file_metadata(
+        df=df,
+        parquet_metadata=collected_metrics[0],
+        stats_columns=compute_statistics_plan(table.schema(), table.properties),
+        parquet_column_mapping=parquet_path_to_id_mapping(table.schema()),
+    )
+    return iter([df])
+
+
+def write_file_modified(table: Table, tasks: Iterator[WriteTask]) -> Iterator[DataFile]:
+    task = next(tasks)
+
+    try:
+        _ = next(tasks)
+        # If there are more tasks, raise an exception
+        raise ValueError("Only unpartitioned writes are supported: https://github.com/apache/iceberg-python/issues/208")
+    except StopIteration:
+        pass
+
+    df = task.df
+
+    file_path = f'{table.location()}/data/{_generate_datafile_filename("parquet")}'
+    file_schema = schema_to_pyarrow_modified(table.schema())
 
     collected_metrics: List[pq.FileMetaData] = []
     fo = table.io.new_output(file_path)

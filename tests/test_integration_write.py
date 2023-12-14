@@ -137,9 +137,6 @@ def arrow_table_with_null() -> pa.Table:
     return pa.Table.from_pydict(TEST_DATA_WITH_NULL, schema=pa_schema)
 
 
-
-
-
 @pytest.fixture(scope="session", autouse=True)
 def table_v1_with_null(session_catalog: Catalog, arrow_table_with_null: pa.Table) -> None:
     identifier = "default.arrow_table_v1_with_null"
@@ -378,7 +375,9 @@ def test_write_arrow_parquet_fields_projection(session_catalog: Catalog, simple_
         NestedField(field_id=1, name="id", field_type=StringType(), required=False),
         NestedField(field_id=2, name="dl_snapshot_date", field_type=DateType(), required=False),
     )
-    identifier = "default.test_fields_projection"
+
+    print("===========Illustrating field ids are not projected============")
+    identifier = "default.test_fields_projection_raw"
 
     try:
         session_catalog.drop_table(identifier=identifier)
@@ -402,3 +401,30 @@ def test_write_arrow_parquet_fields_projection(session_catalog: Catalog, simple_
     )
     parquet_schema = pa.parquet.ParquetFile(s3fs.open_input_file(o.netloc + o.path)).schema
     print("Schema of parquet file written by write_arrow has field ids as -1:", parquet_schema)
+    
+
+    print("===========Illustrating a possible modification============")
+    identifier = "default.test_fields_projection_modied"
+
+    try:
+        session_catalog.drop_table(identifier=identifier)
+    except NoSuchTableError:
+        pass
+
+    tbl = session_catalog.create_table(identifier=identifier, schema=iceberg_table_schema, properties={'format-version': '2'})
+    tbl.write_arrow_modified(simple_table)
+
+    # table could still be read since number of parquet columns match that of iceberg
+    print("Read table just written:", tbl.scan().to_arrow().to_pandas())
+    
+    # but field ids in the parquet files are -1
+    path = (tbl.current_snapshot().manifests(tbl.io)[0].fetch_manifest_entry(tbl.io)[0].data_file.file_path)
+    o = urlparse(path)
+    s3fs = pa.fs.S3FileSystem(
+        scheme="https",
+        endpoint_override="http://localhost:9000",
+        secret_key="password",
+        access_key="admin",
+    )
+    parquet_schema = pa.parquet.ParquetFile(s3fs.open_input_file(o.netloc + o.path)).schema
+    print("Schema of parquet file written by write_arrow has field ids", parquet_schema)

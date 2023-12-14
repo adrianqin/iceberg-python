@@ -884,6 +884,50 @@ class Table:
     def update_schema(self, allow_incompatible_changes: bool = False, case_sensitive: bool = True) -> UpdateSchema:
         return UpdateSchema(self, allow_incompatible_changes=allow_incompatible_changes, case_sensitive=case_sensitive)
 
+    def write_arrow_modified(self, df: pa.Table, mode: Literal['append', 'overwrite'] = 'overwrite') -> None:
+        if len(self.spec().fields) > 0:
+            raise ValueError("Currently only unpartitioned tables are supported")
+
+        snapshot_id = self.new_snapshot_id()
+        parent_snapshot_id = current_snapshot.snapshot_id if (current_snapshot := self.current_snapshot()) else None
+
+        data_files = _dataframe_to_data_files_modified(self, snapshot_id=snapshot_id, df=df)
+        merge = _MergeAppend(table=self, snapshot_id=snapshot_id)
+        for data_file in data_files:
+            merge.append_datafile(data_file)
+
+        if mode == "overwrite":
+            if _ := self.current_snapshot():
+                operation = Operation.OVERWRITE
+            else:
+                operation = Operation.APPEND
+        elif mode == "append":
+            if current_snapshot := self.current_snapshot():
+                for manifest in current_snapshot.manifests(self.io):
+                    merge.append_manifest(manifest)
+            operation = Operation.APPEND
+        else:
+            raise ValueError(f"Unknown write mode: {mode}")
+
+        new_summary, manifests = merge.manifests()
+        summary = update_snapshot_summaries(
+            summary=Summary(operation=operation, **new_summary),
+            previous_summary=None
+            if parent_snapshot_id is None
+            else snapshot.summary
+            if (snapshot := self.snapshot_by_id(parent_snapshot_id))
+            else None,
+        )
+
+        snapshot = _manifests_to_manifest_list(
+            self, snapshot_id=snapshot_id, parent_snapshot_id=parent_snapshot_id, manifests=manifests, summary=summary
+        )
+
+        with self.transaction() as tx:
+            tx.add_snapshot(snapshot=snapshot)
+            tx.set_ref_snapshot(snapshot_id=snapshot.snapshot_id)
+
+
     def write_arrow(self, df: pa.Table, mode: Literal['append', 'overwrite'] = 'overwrite') -> None:
         if len(self.spec().fields) > 0:
             raise ValueError("Currently only unpartitioned tables are supported")
@@ -2031,6 +2075,14 @@ def _dataframe_to_data_files(table: Table, snapshot_id: int, df: pa.Table) -> It
     # This is an iter, so we don't have to materialize everything every time
     # This will be more relevant when we start doing partitioned writes
     yield from write_file(table, iter([WriteTask(df)]))
+
+
+def _dataframe_to_data_files_modified(table: Table, snapshot_id: int, df: pa.Table) -> Iterable[DataFile]:
+    from pyiceberg.io.pyarrow import write_file_modified
+
+    # This is an iter, so we don't have to materialize everything every time
+    # This will be more relevant when we start doing partitioned writes
+    yield from write_file_modified(table, iter([WriteTask(df)]))
 
 
 def _manifests_to_manifest_list(
